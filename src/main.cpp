@@ -2,18 +2,15 @@
 #include "RF24.h"
 #include "mpr121.h"
 #include "i2c.h"
+#include <avr/sleep.h>
+#include <avr/power.h>
 
 RF24 radio(9, 10); // CE, CSN
 
-void radio_send(uint8_t value) {
-  char text[8];
-  sprintf(text, "%d", value);
-  // Serial.println(text);
-  radio.write(&text, sizeof(text));
-  // radio.flush_tx();
-}
+volatile int wakeUpFromInterrupt = 1;
+int touch_shield_value = 99;
 
-void new_touch() {
+static int read_touch_shield() {
   int touchstatus = (mpr121Read(0x01) << 8) | mpr121Read(0x00);
   int touchNumber = 0;
   for (int j=0; j<12; j++) {
@@ -22,9 +19,10 @@ void new_touch() {
     }
   }
   if (touchNumber != 1) {
-    return;
+    return 99;
   }
-  int value = 0;
+
+  int value = 99;
   if (touchstatus & (1<<8)) { value = 1; }
   else if (touchstatus & (1<<5)) { value = 2; }
   else if (touchstatus & (1<<2)) { value = 3; }
@@ -38,9 +36,24 @@ void new_touch() {
   // ELE9 9
   // ELE10 10
   // ELE11 11
-  radio_send(value);
+  return value;
 }
-
+static void touch_shield_it() {
+  if(wakeUpFromInterrupt == 0){
+    Serial.println("wake up from shield");
+    detachInterrupt(digitalPinToInterrupt(2));
+    detachInterrupt(digitalPinToInterrupt(3));
+    wakeUpFromInterrupt = 1;
+  }
+}
+static void radio_it() {
+  if(wakeUpFromInterrupt == 0){
+    Serial.println("wake up from radio");
+    detachInterrupt(digitalPinToInterrupt(2));
+    detachInterrupt(digitalPinToInterrupt(3));
+    wakeUpFromInterrupt = 1;
+  }
+}
 void setup() {
   // radio
   radio.begin();
@@ -50,11 +63,13 @@ void setup() {
   radio.setChannel(125);
   radio.setAutoAck(1);
   radio.setPayloadSize(8);
-  // radio.disableAckPayload();
   radio.setRetries(5, 5);  // max 15, 15
   radio.setAddressWidth(3);
   radio.openWritingPipe(0x000001);
-  radio.stopListening();
+  radio.openReadingPipe(1, 0x000002);
+  radio.startListening();
+  pinMode(3, INPUT);
+  digitalWrite(3, HIGH);
 
   // Touch shield
   pinMode(2, INPUT);
@@ -62,12 +77,72 @@ void setup() {
   DDRC |= 0b00010011;
   PORTC = 0b00110000;
   i2cInit();
-  delay(100);
+  delay(100);  // needed for radio too
   mpr121QuickConfig();
-  attachInterrupt(0, new_touch, LOW);
+
+  // LED Ack
+  pinMode(7, OUTPUT);
 
   Serial.begin(57600);
-  radio_send(0);
-}
 
-void loop() {}
+  digitalWrite(7, HIGH);
+  delay(200);
+  digitalWrite(7, LOW);
+}
+void loop() {
+  // sleep
+  if (digitalRead(2) == LOW || digitalRead(3) == LOW) {
+    // Serial.println("can't sleep");
+  } else {
+    // Serial.println("sleeping");
+    Serial.flush();
+    set_sleep_mode(SLEEP_MODE_STANDBY);
+    set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+    sleep_enable();
+    attachInterrupt(digitalPinToInterrupt(2), touch_shield_it, FALLING);
+    attachInterrupt(digitalPinToInterrupt(3), radio_it, FALLING);
+    wakeUpFromInterrupt = 0;
+    sleep_mode();
+    sleep_disable();
+    while(!wakeUpFromInterrupt); // wait IT catch before start run
+  }
+  while (digitalRead(2) == LOW) {
+    touch_shield_value = read_touch_shield();
+    if (touch_shield_value != 99) {
+      char text[8];
+      sprintf(text, "%d", touch_shield_value);
+      Serial.println(text);
+      radio.stopListening();
+      radio.write(&text, sizeof(text));
+      radio.startListening();
+      digitalWrite(7, HIGH);
+      delay(2);
+      digitalWrite(7, LOW);
+      delay(300);
+    }
+  }
+  while (digitalRead(3) == LOW) {
+    char radio_input[8] = "";
+    radio.read(&radio_input, sizeof(radio_input));
+    if (radio_input[0] == *"A") {
+      digitalWrite(7, HIGH);
+      delay(2);
+      digitalWrite(7, LOW);
+      delay(100);
+      digitalWrite(7, HIGH);
+      delay(2);
+      digitalWrite(7, LOW);
+    } else if (radio_input[0] == *"S") {
+      digitalWrite(7, HIGH);
+      delay(2);
+      digitalWrite(7, LOW);
+      delay(100);
+      digitalWrite(7, HIGH);
+      delay(2);
+      digitalWrite(7, LOW);
+      radio.stopListening();
+      radio.write(&"S", sizeof("S"));
+      radio.startListening();
+    }
+  }
+}
